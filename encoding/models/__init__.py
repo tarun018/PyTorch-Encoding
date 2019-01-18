@@ -7,15 +7,17 @@ from .fcn import *
 from .psp import *
 from .encnet import *
 from .deeplab import *
+from .danet import *
 
 def get_segmentation_model(name, **kwargs):
     from .fcn import get_fcn
     models = {
         'fcn': get_fcn,
         'psp': get_psp,
-        'atten': get_atten,
+        # 'atten': get_atten,
         'encnet': get_encnet,
-        'encnetv2': get_encnetv2,
+        # 'encnetv2': get_encnetv2,
         'deeplab': get_deeplab,
+        'danet': get_danet,
     }
     return models[name.lower()](**kwargs)

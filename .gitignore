@@ -3,8 +3,13 @@
 *.pyc
 version.py
 build/
-data/
+/dataset
+/bin
+/exp
+/pretrain_models
 docs/src/
 docs/html/
 encoding/_ext/
 encoding.egg-info/
+.idea
+.*

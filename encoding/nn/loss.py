@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch.autograd import Variable
 import numpy as np
-__all__ = ['SegmentationLosses', 'OhemCrossEntropy2d', 'OHEMSegmentationLosses']
+__all__ = ['SegmentationLosses', 'SegmentationMultiLosses', 'OhemCrossEntropy2d', 'OHEMSegmentationLosses']
 
 class SegmentationLosses(nn.CrossEntropyLoss):
     """2D Cross Entropy Loss with Auxilary Loss"""
@@ -52,6 +52,19 @@ class SegmentationLosses(nn.CrossEntropyLoss):
             vect = hist>0
             tvect[i] = vect
         return tvect
+
+
+class SegmentationMultiLosses(nn.CrossEntropyLoss):
+    """2D Cross Entropy Loss with Multi-Loss"""
+
+    def forward(self, *inputs):
+        preds = inputs[:-1]
+        target = inputs[-1]
+        loss = 0
+        for p in preds:
+            loss += super(SegmentationMultiLosses, self).forward(p, target)
+        return loss
+
 
 # adapted from https://github.com/PkuRainBow/OCNet/blob/master/utils/loss.py
 class OhemCrossEntropy2d(nn.Module):

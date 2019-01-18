@@ -58,7 +58,7 @@ class Encoding(Module):
 
     Reference:
         Hang Zhang, Kristin Dana, Jianping Shi, Zhongyue Zhang, Xiaogang Wang, Ambrish Tyagi,
-        Amit Agrawal. “Context Encoding for Semantic Segmentation.
+        Amit Agrawal. "Context Encoding for Semantic Segmentation.
         *The IEEE Conference on Computer Vision and Pattern Recognition (CVPR) 2018*
 
         Hang Zhang, Jia Xue, and Kristin Dana. "Deep TEN: Texture Encoding Network."
