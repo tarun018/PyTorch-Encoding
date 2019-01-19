@@ -81,7 +81,7 @@ class Options():
         parser.add_argument('--only-val', action='store_true', default=False,
                             help='only validation, no training')
         # visualization
-        parser.add_argument('--dir_of_im_to_vis', type=str, default=None, help='Directory of images, some of which will be chosen to visualize')
+        parser.add_argument('--dir_of_im_to_vis', type=str, default='/mnt/data-1/data/houjing.huang/Project/EANet_cluster/EANet_Data/dataset/market1501/Market-1501-v15.09.15/bounding_box_train', help='Directory of images, some of which will be chosen to visualize')
         parser.add_argument('--ext_of_im_to_vis', type=str, default='.jpg')
         parser.add_argument('--num_vis', type=int, default=64)
         parser.add_argument('--exp_dir', type=str, default='exp')

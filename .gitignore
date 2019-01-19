@@ -13,3 +13,6 @@ encoding/_ext/
 encoding.egg-info/
 .idea
 .*
+/encoding/lib/*/*.so
+/encoding/lib/*/*.o
+*.ninja
