@@ -68,6 +68,7 @@ def batch_pix_accuracy(output, target):
         target: label 3D tensor
     """
     _, predict = torch.max(output, 1)
+    assert predict.size() == target.size(), "predict shape {} != target shape {}".format(tuple(predict.size()), tuple(target.size()))
 
     predict = predict.cpu().numpy().astype('int64') + 1
     target = target.cpu().numpy().astype('int64') + 1
@@ -87,6 +88,7 @@ def batch_intersection_union(output, target, nclass):
         nclass: number of categories (int)
     """
     _, predict = torch.max(output, 1)
+    assert predict.size() == target.size(), "predict shape {} != target shape {}".format(tuple(predict.size()), tuple(target.size()))
     mini = 1
     maxi = nclass
     nbins = nclass

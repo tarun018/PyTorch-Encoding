@@ -1,3 +1,7 @@
+###########################################################################
+# Created by: Houjing Huang
+# Copyright (c) 2019
+###########################################################################
 import numpy as np
 from PIL import Image
 import cv2
@@ -149,8 +153,8 @@ def restore_im(im, std, mean, transpose=False, resize_w_h=None):
     return im
 
 
-def mask_to_im(mask, nclass=8, transpose=False):
-    """
+def mask_to_color_im(mask, nclass=8, transpose=False):
+    """Save single-channel mask as color image.
     Args:
         mask: shape [H, W], integer values, 0 <= v < nclass
     Returns:

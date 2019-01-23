@@ -1,8 +1,19 @@
 ###########################################################################
-# Created by: Hang Zhang 
-# Email: zhang.hang@rutgers.edu 
-# Copyright (c) 2017
+# Created by: Houjing Huang
+# Copyright (c) 2019
 ###########################################################################
+"""
+- Allow single GPU.
+  - For single GPU, vanilla BN is used. For multi GPUs, Sync-BN is used.
+  - For single GPU, we have to manually move the data to GPU. For multi GPUs, DataParallel will scatter data to multi GPUs.
+- No CPU mode.
+- Visualize an image list during training.
+- Infer and save prediction for image list.
+- In single-scale validation, use full image instead of center crop.
+- Allow multi-scale eval.
+- Allow no cropping in multi-scale eval.
+- The model is DANet.
+"""
 
 from __future__ import print_function
 import os
@@ -21,15 +32,18 @@ import encoding.utils as utils
 from encoding.nn import SyncBatchNorm
 from encoding.nn import SegmentationMultiLosses
 from encoding.parallel import DataParallelModel, DataParallelCriterion
-from encoding.datasets import get_dataset
+from encoding.datasets import get_dataset, test_batchify_fn
 from encoding.models import get_segmentation_model
-from encoding.models import MultiEvalModule
+from encoding.models.danet_base import MultiEvalModule
 
-from option_coco_part import Options
-from infer_utils import vis_im_list
-from file_utils import walkdir
+from option import Options
+from encoding.utils.infer_utils import vis_im_list
+from encoding.utils.infer_utils import infer_and_save_im_list
+from encoding.utils.file_utils import walkdir
+from encoding.utils.file_utils import read_lines
 
 
+print('[PYTORCH VERSION]:', torch.__version__)
 torch_ver = torch.__version__[:3]
 if torch_ver == '0.3':
     from torch.autograd import Variable
@@ -44,16 +58,19 @@ class Trainer():
         # dataset
         data_kwargs = {'transform': input_transform, 'base_size': args.base_size, 'crop_size': args.crop_size}
         trainset = get_dataset(args.dataset, split=args.train_split, mode='train', **data_kwargs)
-        valset = get_dataset(args.dataset, split='val', mode='ms_val' if args.multi_scale_val else 'fast_val', **data_kwargs)
+        valset = get_dataset(args.dataset, split='val', mode='ms_val' if args.multi_scale_eval else 'fast_val', **data_kwargs)
         # dataloader
-        kwargs = {'num_workers': args.workers, 'pin_memory': True} if args.cuda else {}
+        kwargs = {'num_workers': args.workers, 'pin_memory': True}
         self.trainloader = data.DataLoader(trainset, batch_size=args.batch_size, drop_last=True, shuffle=True, **kwargs)
-        self.valloader = data.DataLoader(valset, batch_size=args.batch_size, drop_last=False, shuffle=False, **kwargs)
+        if self.args.multi_scale_eval:
+            kwargs['collate_fn'] = test_batchify_fn
+        self.valloader = data.DataLoader(valset, batch_size=args.test_batch_size, drop_last=False, shuffle=False, **kwargs)
         self.nclass = trainset.num_class
         # model
         if args.norm_layer == 'bn':
             norm_layer = BatchNorm2d
         elif args.norm_layer == 'sync_bn':
+            assert args.multi_gpu, "SyncBatchNorm can only be used when multi GPUs are available!"
             norm_layer = SyncBatchNorm
         else:
             raise ValueError('Invalid norm_layer {}'.format(args.norm_layer))
@@ -81,7 +98,7 @@ class Trainer():
         if args.multi_gpu:
             self.model = DataParallelModel(self.model).cuda()
             self.criterion = DataParallelCriterion(self.criterion).cuda()
-        elif args.cuda:
+        else:
             self.model = self.model.cuda()
             self.criterion = self.criterion.cuda()
         self.single_device_model = self.model.module if self.args.multi_gpu else self.model
@@ -92,20 +109,17 @@ class Trainer():
             checkpoint = torch.load(args.resume)
             args.start_epoch = checkpoint['epoch']
             self.single_device_model.load_state_dict(checkpoint['state_dict'])
-            if not args.ft:
+            if not args.ft and not (args.only_val or args.only_vis or args.only_infer):
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
             self.best_pred = checkpoint['best_pred']
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
+            print("=> loaded checkpoint '{}' (epoch {}), best_pred {}"
+                  .format(args.resume, checkpoint['epoch'], checkpoint['best_pred']))
         # clear start epoch if fine-tuning
         if args.ft:
             args.start_epoch = 0
         # lr scheduler
         self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.6)
         self.best_pred = 0.0
-        self.eval_scales = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-        self.ms_evaluator = MultiEvalModule(self.single_device_model, self.nclass, scales=self.eval_scales)
-        self.metric = utils.SegmentationMetric(self.nclass)
 
     def save_ckpt(self, epoch, score):
         is_best = False
@@ -126,6 +140,9 @@ class Trainer():
         tbar = tqdm(self.trainloader, miniters=20)
         for i, (image, target) in enumerate(tbar):
 
+            if not self.args.multi_gpu:
+                image = image.cuda()
+                target = target.cuda()
             self.optimizer.zero_grad()
             if torch_ver == "0.3":
                 image = Variable(image)
@@ -134,7 +151,7 @@ class Trainer():
             if self.args.multi_gpu:
                 loss = self.criterion(outputs, target)
             else:
-                loss = self.criterion(list(outputs) + [target])
+                loss = self.criterion(*(outputs + (target,)))
             loss.backward()
             self.optimizer.step()
             train_loss += loss.item()
@@ -146,38 +163,82 @@ class Trainer():
     def validation(self, epoch):
 
         def _get_pred(batch_im):
-            # metric.update also accepts list, so no need to gather results from multi gpus
-            if self.args.multi_scale_val:
-                assert len(batch_im) <= torch.cuda.device_count()
-                pred = self.ms_evaluator.parallel_forward(batch_im)
-            else:
-                outputs = self.model(batch_im)
-                pred = [out[0] for out in outputs]
-            return pred
+            with torch.no_grad():
+                # metric.update also accepts list, so no need to gather results from multi gpus
+                if self.args.multi_scale_eval:
+                    assert len(batch_im) <= torch.cuda.device_count(), "Multi-scale testing only allows batch size <= number of GPUs"
+                    scattered_pred = self.ms_evaluator.parallel_forward(batch_im)
+                else:
+                    outputs = self.model(batch_im)
+                    scattered_pred = [out[0] for out in outputs] if self.args.multi_gpu else [outputs[0]]
+            return scattered_pred
 
+        # Lazy creation
+        if not hasattr(self, 'ms_evaluator'):
+            self.ms_evaluator = MultiEvalModule(self.single_device_model, self.nclass, scales=self.args.eval_scales, crop=self.args.crop_eval)
+            self.metric = utils.SegmentationMetric(self.nclass)
         self.model.eval()
         tbar = tqdm(self.valloader, desc='\r')
         for i, (batch_im, target) in enumerate(tbar):
-            pred = _get_pred(batch_im)
-            self.metric.update(target, pred)
+            # No need to put target to GPU, since the metrics are calculated by numpy.
+            # And no need to put data to GPU manually if we use data parallel.
+            if not self.args.multi_gpu and not isinstance(batch_im, (list, tuple)):
+                batch_im = batch_im.cuda()
+            scattered_pred = _get_pred(batch_im)
+            scattered_target = []
+            ind = 0
+            for p in scattered_pred:
+                target_tmp = target[ind:ind + len(p)]
+                # Multi-scale testing. In fact, len(target_tmp) == 1
+                if isinstance(target_tmp, (list, tuple)):
+                    assert len(target_tmp) == 1
+                    target_tmp = torch.stack(target_tmp)
+                scattered_target.append(target_tmp)
+                ind += len(p)
+            self.metric.update(scattered_target, scattered_pred)
             pixAcc, mIoU = self.metric.get()
             tbar.set_description('ep {}, pixAcc: {:.4f}, mIoU: {:.4f}'.format(epoch + 1, pixAcc, mIoU))
         return self.metric.get()
 
     def visualize(self, epoch):
+        if (self.args.dir_of_im_to_vis == 'None') and (self.args.im_list_file_to_vis == 'None'):
+            return
         if not hasattr(self, 'vis_im_paths'):
-            im_paths = list(walkdir(self.args.dir_of_im_to_vis, ext=self.args.ext_of_im_to_vis))
+            if self.args.dir_of_im_to_vis != 'None':
+                print('=> Visualize Dir {}'.format(self.args.dir_of_im_to_vis))
+                im_paths = list(walkdir(self.args.dir_of_im_to_vis, exts=['.jpg', '.png']))
+            else:
+                print('=> Visualize Image List {}'.format(self.args.im_list_file_to_vis))
+                im_paths = read_lines(self.args.im_list_file_to_vis)
+            print('=> Save Dir {}'.format(self.args.vis_save_dir))
             im_paths = sorted(im_paths)
-            np.random.RandomState(seed=1).shuffle(im_paths)
-            self.vis_im_paths = im_paths[:self.args.num_vis]
+            # np.random.RandomState(seed=1).shuffle(im_paths)
+            self.vis_im_paths = im_paths[:self.args.max_num_vis]
         cfg = {
-            'save_path': os.path.join(self.args.exp_dir, 'vis', 'vis_epoch{}.png'.format(epoch)),
-            'multi_scale_test': self.args.multi_scale_val,
+            'save_path': os.path.join(self.args.vis_save_dir, 'vis_epoch{}.png'.format(epoch)),
+            'multi_scale': self.args.multi_scale_eval,
+            'crop': self.args.crop_eval,
             'num_class': self.nclass,
-            'scales': self.eval_scales,
+            'scales': self.args.eval_scales,
             'base_size': self.args.base_size,
         }
         vis_im_list(self.single_device_model, self.vis_im_paths, cfg)
+
+    def infer_and_save(self, infer_dir, infer_save_dir):
+        print('=> Infer Dir {}'.format(infer_dir))
+        print('=> Save Dir {}'.format(infer_save_dir))
+        sub_im_paths = list(walkdir(infer_dir, exts=['.jpg', '.png'], sub_path=True))
+        im_paths = [os.path.join(infer_dir, p) for p in sub_im_paths]
+        # NOTE: Don't save result as JPEG, since it causes aliasing.
+        save_paths = [os.path.join(infer_save_dir, p.replace('.jpg', '.png')) for p in sub_im_paths]
+        cfg = {
+            'multi_scale': self.args.multi_scale_eval,
+            'crop': self.args.crop_eval,
+            'num_class': self.nclass,
+            'scales': self.args.eval_scales,
+            'base_size': self.args.base_size,
+        }
+        infer_and_save_im_list(self.single_device_model, im_paths, save_paths, cfg)
 
 
 if __name__ == "__main__":
@@ -188,12 +249,16 @@ if __name__ == "__main__":
     print('Total Epoches:', trainer.args.epochs)
     if args.only_val:
         trainer.validation(trainer.args.start_epoch)
+    elif args.only_vis:
+        trainer.visualize(trainer.args.start_epoch)
+    elif args.only_infer:
+        trainer.infer_and_save(args.dir_of_im_to_infer, args.infer_save_dir)
     else:
         for epoch in range(trainer.args.start_epoch, trainer.args.epochs):
-            trainer.visualize(epoch)
             trainer.training(epoch)
             score = trainer.best_pred
             if not trainer.args.no_val:
                 pixAcc, mIoU = trainer.validation(epoch)
                 score = (pixAcc + mIoU) * 0.5
             trainer.save_ckpt(epoch, score)
+            trainer.visualize(epoch)

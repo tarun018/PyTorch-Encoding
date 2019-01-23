@@ -1,7 +1,6 @@
 ###########################################################################
-# Created by: Hang Zhang 
-# Email: zhang.hang@rutgers.edu 
-# Copyright (c) 2017
+# Created by: Houjing Huang
+# Copyright (c) 2019
 ###########################################################################
 
 import math
@@ -78,18 +77,16 @@ class BaseNet(nn.Module):
 class MultiEvalModule(DataParallel):
     """Multi-size Segmentation Eavluator"""
     def __init__(self, module, nclass, device_ids=None, flip=True,
-                 multi_scales=False):
+                 scales=[0.5, 0.75, 1.0, 1.25, 1.5, 1.75], crop=False):
         super(MultiEvalModule, self).__init__(module, device_ids)
         self.nclass = nclass
         self.base_size = module.base_size
         self.crop_size = module.crop_size
-        if not multi_scales:
-            self.scales = [1.0]
-        else:
-            self.scales = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.2]
+        self.scales = scales
         self.flip = flip
-        print('MultiEvalModule: base_size {}, crop_size {}'. \
-            format(self.base_size, self.crop_size))
+        self.crop = crop
+        print('MultiEvalModule: base_size {}, crop_size {}, scales {}, flip {}, crop {}'. \
+            format(self.base_size, self.crop_size, self.scales, self.flip, self.crop))
 
     def parallel_forward(self, inputs, **kwargs):
         """Multi-GPU Mult-size Evaluation
@@ -106,32 +103,31 @@ class MultiEvalModule(DataParallel):
         elif len(kwargs) < len(inputs):
             kwargs.extend([{} for _ in range(len(inputs) - len(kwargs))])
         outputs = self.parallel_apply(replicas, inputs, kwargs)
+        #for out in outputs:
+        #    print('out.size()', out.size())
         return outputs
 
-    def forward(self, image):
-        """Mult-size Evaluation"""
+    def ms_crop_forward(self, image):
+        """Mult-size Evaluation, with multi crop"""
         # only single image is supported for evaluation
         batch, _, h, w = image.size()
         assert(batch == 1)
-        if len(self.scales) == 1:#single scale
-            stride_rate = 2.0/3.0
-        else:
-            stride_rate = 1.0/2.0
+        stride_rate = 2.0/3.0
         crop_size = self.crop_size
         stride = int(crop_size * stride_rate)
         with torch.cuda.device_of(image):
             scores = image.new().resize_(batch,self.nclass,h,w).zero_().cuda()
 
         for scale in self.scales:
-            long_size = int(math.ceil(self.base_size * scale))
+            short_size = int(math.ceil(self.base_size * scale))
             if h > w:
-                height = long_size
-                width = int(1.0 * w * long_size / h + 0.5)
-                short_size = width
+                width = short_size
+                height = int(1.0 * h * short_size / w)
+                long_size = height
             else:
-                width = long_size
-                height = int(1.0 * h * long_size / w + 0.5)
-                short_size = height
+                height = short_size
+                width = int(1.0 * w * short_size / h)
+                long_size = width
             # resize image to current size
             cur_img = resize_image(image, height, width, **self.module._up_kwargs)
             if long_size <= crop_size:
@@ -177,6 +173,32 @@ class MultiEvalModule(DataParallel):
             scores += score
 
         return scores
+
+    def ms_no_crop_forward(self, image):
+        """Mult-size Evaluation, without cropping"""
+        # only single image is supported for evaluation
+        batch, _, h, w = image.size()
+        assert(batch == 1)
+        scores = image.new().resize_(batch,self.nclass,h,w).zero_()
+        for scale in self.scales:
+            short_size = int(math.ceil(self.base_size * scale))
+            if h > w:
+                width = short_size
+                height = int(1.0 * h * short_size / w)
+                long_size = height
+            else:
+                height = short_size
+                width = int(1.0 * w * short_size / h)
+                long_size = width
+            cur_img = resize_image(image, height, width, **self.module._up_kwargs)
+            output = module_inference(self.module, cur_img, self.flip)
+            output = resize_image(output, h, w, **self.module._up_kwargs)
+            scores += output
+        scores = scores * 1. / len(self.scales)
+        return scores
+
+    def forward(self, *inputs, **kwargs):
+        return self.ms_crop_forward(*inputs, **kwargs) if self.crop else self.ms_no_crop_forward(*inputs, **kwargs)
 
 
 def module_inference(module, image, flip=True):

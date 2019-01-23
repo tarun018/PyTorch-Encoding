@@ -16,3 +16,4 @@ encoding.egg-info/
 /encoding/lib/*/*.so
 /encoding/lib/*/*.o
 *.ninja
+/tmp
